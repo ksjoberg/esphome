@@ -334,6 +334,47 @@ uint32_t WaveshareEPaperBWR::get_buffer_length_() {
 uint32_t WaveshareEPaper7C::get_buffer_length_() {
   return this->get_width_controller() * this->get_height_internal() / 8u * 3u;
 }  // 7 colors buffer, 1 pixel = 3 bits, we will store 8 pixels in 24 bits = 3 bytes
+uint32_t WaveshareEPaper4L::get_buffer_length_() {
+  return this->get_width_controller() * this->get_height_internal() / 4u;
+}  // 4-level grayscale buffer, 1 pixel = 2 bits, we will store 4 pixels in 8 bits = 1 byte
+
+uint8_t WaveshareEPaper4L::color_to_grayscale_4level(Color color) {
+  // Convert RGB to grayscale using standard weights
+  uint32_t gray = (color.red * 299u + color.green * 587u + color.blue * 114u) / 1000u;
+  // Map 0-255 to 0-3 (4 levels) matching Waveshare format (inverted):
+  // 0xC0 (11) = Black, 0x80 (10) = Dark Gray, 0x40 (01) = Light Gray, 0x00 (00) = White
+  if (gray < 64) {
+    return 0xC0;  // Black (inverted from white)
+  } else if (gray < 128) {
+    return 0x80;  // Dark gray (inverted from light gray)
+  } else if (gray < 192) {
+    return 0x40;  // Light gray (inverted from dark gray)
+  } else {
+    return 0x00;  // White (inverted from black)
+  }
+}
+
+void WaveshareEPaper4L::fill(Color color) {
+  uint8_t gray = this->color_to_grayscale_4level(color);
+  // Pack 4 pixels into one byte (each pixel = 2 bits in top positions)
+  uint8_t fill_byte = gray | (gray >> 2) | (gray >> 4) | (gray >> 6);
+  for (uint32_t i = 0; i < this->get_buffer_length_(); i++) {
+    this->buffer_[i] = fill_byte;
+    if (i % 1000 == 0)
+      App.feed_wdt();
+  }
+}
+
+void HOT WaveshareEPaper4L::draw_absolute_pixel_internal(int x, int y, Color color) {
+  if (x >= this->get_width_internal() || y >= this->get_height_internal() || x < 0 || y < 0)
+    return;
+
+  uint8_t gray = this->color_to_grayscale_4level(color);
+  const uint32_t pos = (x + y * this->get_width_controller()) / 4u;
+  const uint8_t subpos = (x & 0b11) * 2;  // 0, 2, 4, or 6
+  // Clear the 2 bits and set new value (gray is already in 0xC0, 0x80, 0x40, 0x00 format)
+  this->buffer_[pos] = (this->buffer_[pos] & ~(0xC0 >> subpos)) | (gray >> subpos);
+}
 
 void WaveshareEPaperBWR::fill(Color color) {
   this->filled_rectangle(0, 0, this->get_width(), this->get_height(), color);
@@ -4016,6 +4057,174 @@ uint32_t WaveshareEPaper7P5InV2::idle_timeout_() { return 10000; }
 void WaveshareEPaper7P5InV2::dump_config() {
   LOG_DISPLAY("", "Waveshare E-Paper", this);
   ESP_LOGCONFIG(TAG, "  Model: 7.5inV2rev2");
+  LOG_PIN("  Reset Pin: ", this->reset_pin_);
+  LOG_PIN("  DC Pin: ", this->dc_pin_);
+  LOG_PIN("  Busy Pin: ", this->busy_pin_);
+  LOG_UPDATE_INTERVAL(this);
+}
+
+/* 7.50inV2-G4 (4-level grayscale) */
+bool WaveshareEPaper7P5InV2G4::wait_until_idle_() {
+  if (this->busy_pin_ == nullptr) {
+    return true;
+  }
+
+  const uint32_t start = millis();
+  while (this->busy_pin_->digital_read()) {
+    this->command(0x71);
+    if (millis() - start > this->idle_timeout_()) {
+      ESP_LOGE(TAG, "Timeout while displaying image!");
+      return false;
+    }
+    App.feed_wdt();
+    delay(10);
+  }
+  return true;
+}
+
+void WaveshareEPaper7P5InV2G4::initialize() {
+  // COMMAND PANEL SETTING
+  this->command(0x00);
+  this->data(0x1F);  // KW-3f   KWR-2F  BWROTP 0f  BWOTP 1f
+
+  // COMMAND VCOM AND DATA INTERVAL SETTING (4-gray specific)
+  this->command(0x50);
+  this->data(0x10);
+  this->data(0x07);
+
+  // COMMAND POWER ON
+  this->command(0x04);
+  delay(100);  // NOLINT
+  this->wait_until_idle_();
+
+  // COMMAND BOOSTER SOFT START (enhanced for 4-gray)
+  this->command(0x06);
+  this->data(0x27);
+  this->data(0x27);
+  this->data(0x18);
+  this->data(0x17);
+
+  // COMMAND FLASH MODE (4-gray specific)
+  this->command(0xE0);
+  this->data(0x02);
+
+  this->command(0xE5);
+  this->data(0x5F);  // 4-gray mode value (vs 0x5A for normal mode)
+}
+
+void HOT WaveshareEPaper7P5InV2G4::display() {
+  // For 4-level grayscale, we need to send data to both DTM1 (0x10) and DTM2 (0x13)
+  // Input: 96000 bytes (800x480 pixels, 2 bits per pixel, 4 pixels per byte)
+  // Output: 48000 bytes per RAM (800x480 pixels, 1 bit per pixel per RAM, 8 pixels per byte)
+  const uint32_t output_len = 48000;  // 800 * 480 / 8
+
+  // COMMAND POWER ON
+  ESP_LOGI(TAG, "Power on the display");
+  this->command(0x04);
+  delay(200);  // NOLINT
+  this->wait_until_idle_();
+
+  uint8_t temp1, temp2, temp3;
+
+  // COMMAND DATA START TRANSMISSION 1 (DTM1) - "old data"
+  this->command(0x10);
+  delay(2);
+  for (uint32_t i = 0; i < output_len; i++) {
+    temp3 = 0;
+    for (uint8_t j = 0; j < 2; j++) {
+      temp1 = this->buffer_[i * 2 + j];
+      for (uint8_t k = 0; k < 2; k++) {
+        temp2 = temp1 & 0xC0;
+        if (temp2 == 0xC0)  // White
+          temp3 |= 0x00;
+        else if (temp2 == 0x00)  // Black
+          temp3 |= 0x01;
+        else if (temp2 == 0x80)  // Light gray
+          temp3 |= 0x01;
+        else  // 0x40 - Dark gray
+          temp3 |= 0x00;
+        temp3 <<= 1;
+        temp1 <<= 2;
+
+        temp2 = temp1 & 0xC0;
+        if (temp2 == 0xC0)
+          temp3 |= 0x00;
+        else if (temp2 == 0x00)
+          temp3 |= 0x01;
+        else if (temp2 == 0x80)
+          temp3 |= 0x01;
+        else  // 0x40
+          temp3 |= 0x00;
+        if (j != 1 || k != 1)
+          temp3 <<= 1;
+        temp1 <<= 2;
+      }
+    }
+    this->data(temp3);
+    if (i % 1000 == 0)
+      App.feed_wdt();
+  }
+
+  // COMMAND DATA START TRANSMISSION 2 (DTM2) - "new data"
+  this->command(0x13);
+  delay(2);
+  for (uint32_t i = 0; i < output_len; i++) {
+    temp3 = 0;
+    for (uint8_t j = 0; j < 2; j++) {
+      temp1 = this->buffer_[i * 2 + j];
+      for (uint8_t k = 0; k < 2; k++) {
+        temp2 = temp1 & 0xC0;
+        if (temp2 == 0xC0)  // White
+          temp3 |= 0x00;
+        else if (temp2 == 0x00)  // Black
+          temp3 |= 0x01;
+        else if (temp2 == 0x80)  // Light gray
+          temp3 |= 0x00;
+        else  // 0x40 - Dark gray
+          temp3 |= 0x01;
+        temp3 <<= 1;
+        temp1 <<= 2;
+
+        temp2 = temp1 & 0xC0;
+        if (temp2 == 0xC0)  // White
+          temp3 |= 0x00;
+        else if (temp2 == 0x00)  // Black
+          temp3 |= 0x01;
+        else if (temp2 == 0x80)  // Light gray
+          temp3 |= 0x00;
+        else  // 0x40 - Dark gray
+          temp3 |= 0x01;
+        if (j != 1 || k != 1)
+          temp3 <<= 1;
+        temp1 <<= 2;
+      }
+    }
+    this->data(temp3);
+    if (i % 1000 == 0)
+      App.feed_wdt();
+  }
+
+  delay(100);  // NOLINT
+  this->wait_until_idle_();
+
+  // COMMAND DISPLAY REFRESH
+  this->command(0x12);
+  delay(100);  // NOLINT
+  this->wait_until_idle_();
+
+  ESP_LOGV(TAG, "Before command(0x02) (>> power off)");
+  this->command(0x02);
+  this->wait_until_idle_();
+  ESP_LOGV(TAG, "After command(0x02) (>> power off)");
+}
+
+int WaveshareEPaper7P5InV2G4::get_width_internal() { return 800; }
+int WaveshareEPaper7P5InV2G4::get_height_internal() { return 480; }
+uint32_t WaveshareEPaper7P5InV2G4::idle_timeout_() { return 10000; }
+
+void WaveshareEPaper7P5InV2G4::dump_config() {
+  LOG_DISPLAY("", "Waveshare E-Paper", this);
+  ESP_LOGCONFIG(TAG, "  Model: 7.5inV2-G4 (4-level grayscale)");
   LOG_PIN("  Reset Pin: ", this->reset_pin_);
   LOG_PIN("  DC Pin: ", this->dc_pin_);
   LOG_PIN("  Busy Pin: ", this->busy_pin_);

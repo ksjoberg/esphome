@@ -103,6 +103,18 @@ class WaveshareEPaper7C : public WaveshareEPaperBase {
   uint8_t *buffers_[NUM_BUFFERS];
 };
 
+class WaveshareEPaper4L : public WaveshareEPaperBase {
+ public:
+  void fill(Color color) override;
+
+  display::DisplayType get_display_type() override { return display::DisplayType::DISPLAY_TYPE_GRAYSCALE; }
+
+ protected:
+  void draw_absolute_pixel_internal(int x, int y, Color color) override;
+  uint32_t get_buffer_length_() override;
+  uint8_t color_to_grayscale_4level(Color color);
+};
+
 enum WaveshareEPaperTypeAModel {
   WAVESHARE_EPAPER_1_54_IN = 0,
   WAVESHARE_EPAPER_1_54_IN_V2,
@@ -911,6 +923,33 @@ class WaveshareEPaper7P5InBC : public WaveshareEPaper {
 };
 
 class WaveshareEPaper7P5InV2 : public WaveshareEPaper {
+ public:
+  bool wait_until_idle_();
+
+  void initialize() override;
+
+  void display() override;
+
+  void dump_config() override;
+
+  void deep_sleep() override {
+    // COMMAND POWER OFF
+    this->command(0x02);
+    this->wait_until_idle_();
+    // COMMAND DEEP SLEEP
+    this->command(0x07);
+    this->data(0xA5);  // check byte
+  }
+
+ protected:
+  int get_width_internal() override;
+
+  int get_height_internal() override;
+
+  uint32_t idle_timeout_() override;
+};
+
+class WaveshareEPaper7P5InV2G4 : public WaveshareEPaper4L {
  public:
   bool wait_until_idle_();
 

@@ -25,6 +25,7 @@ WaveshareEPaperBWR = waveshare_epaper_ns.class_(
     "WaveshareEPaperBWR", WaveshareEPaperBase
 )
 WaveshareEPaper7C = waveshare_epaper_ns.class_("WaveshareEPaper7C", WaveshareEPaperBase)
+WaveshareEPaper4L = waveshare_epaper_ns.class_("WaveshareEPaper4L", WaveshareEPaperBase)
 WaveshareEPaperTypeA = waveshare_epaper_ns.class_(
     "WaveshareEPaperTypeA", WaveshareEPaper
 )
@@ -101,6 +102,9 @@ WaveshareEPaper7P5InBV3BWR = waveshare_epaper_ns.class_(
 WaveshareEPaper7P5InV2 = waveshare_epaper_ns.class_(
     "WaveshareEPaper7P5InV2", WaveshareEPaper
 )
+WaveshareEPaper7P5InV2G4 = waveshare_epaper_ns.class_(
+    "WaveshareEPaper7P5InV2G4", WaveshareEPaper4L
+)
 WaveshareEPaper7P5InV2alt = waveshare_epaper_ns.class_(
     "WaveshareEPaper7P5InV2alt", WaveshareEPaper
 )
@@ -165,6 +169,7 @@ MODELS = {
     "7.50in-bv3-bwr": ("b", WaveshareEPaper7P5InBV3BWR),
     "7.50in-bc": ("b", WaveshareEPaper7P5InBC),
     "7.50inv2": ("b", WaveshareEPaper7P5InV2),
+    "7.50inv2-g4": ("b", WaveshareEPaper7P5InV2G4),
     "7.50inv2alt": ("b", WaveshareEPaper7P5InV2alt),
     "7.50inv2p": ("c", WaveshareEPaper7P5InV2P),
     "7.50in-hd-b": ("b", WaveshareEPaper7P5InHDB),
