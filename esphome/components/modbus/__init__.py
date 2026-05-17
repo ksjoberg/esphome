@@ -26,6 +26,7 @@ ModbusRole = modbus_ns.enum("ModbusRole")
 MODBUS_ROLES = {
     "client": ModbusRole.CLIENT,
     "server": ModbusRole.SERVER,
+    "spy": ModbusRole.SPY,
 }
 
 CONFIG_SCHEMA = (
@@ -77,7 +78,7 @@ def modbus_device_schema(default_address):
 
 
 def final_validate_modbus_device(
-    name: str, *, role: Literal["server", "client"] | None = None
+    name: str, *, role: Literal["server", "client", "spy"] | None = None
 ):
     def validate_role(value):
         assert role in MODBUS_ROLES

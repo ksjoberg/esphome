@@ -56,6 +56,13 @@ void Modbus::loop() {
     this->clear_rx_buffer_(LOG_STR("timeout after partial response"), true);
   }
 
+  // In spy mode: if we've been waiting for a response but none arrived within send_wait_time_, reset
+  if (this->role == ModbusRole::SPY && this->spy_expect_response_ &&
+      millis() - this->last_modbus_byte_ > this->send_wait_time_) {
+    ESP_LOGW(TAG, "Spy: no response from unit %" PRIu8 " within timeout, resetting", this->spy_pending_address_);
+    this->spy_expect_response_ = false;
+  }
+
   // If we're past the send_wait_time timeout and response buffer doesn't have the start of the expected response
   if (this->waiting_for_response_ != 0 &&
       millis() - this->last_send_ > this->last_send_tx_offset_ + this->send_wait_time_ &&
@@ -162,7 +169,10 @@ bool Modbus::parse_modbus_byte_(uint8_t byte) {
 
   } else {
     // data starts at 2 and length is 4 for read registers commands
-    if (this->role == ModbusRole::SERVER) {
+    // Spy mode alternates: first frame is a request (parsed as server), second is a response (parsed as client)
+    bool parse_as_request = (this->role == ModbusRole::SERVER) ||
+                             (this->role == ModbusRole::SPY && !this->spy_expect_response_);
+    if (parse_as_request) {
       if (function_code == ModbusFunctionCode::READ_COILS ||
           function_code == ModbusFunctionCode::READ_DISCRETE_INPUTS ||
           function_code == ModbusFunctionCode::READ_HOLDING_REGISTERS ||
@@ -227,49 +237,87 @@ bool Modbus::parse_modbus_byte_(uint8_t byte) {
     }
   }
   std::vector<uint8_t> data(this->rx_buffer_.begin() + data_offset, this->rx_buffer_.begin() + data_offset + data_len);
-  bool found = false;
-  for (auto *device : this->devices_) {
-    if (device->address_ == address) {
-      found = true;
-      if (this->role == ModbusRole::SERVER) {
-        if (function_code == ModbusFunctionCode::READ_HOLDING_REGISTERS ||
+
+  if (this->role == ModbusRole::SPY) {
+    if (!this->spy_expect_response_) {
+      // Observed a request; cache context for the coming response
+      if (address != 0x00) {  // broadcast has no response
+        this->spy_pending_address_ = address;
+        this->spy_pending_fc_ = function_code;
+        if (function_code == ModbusFunctionCode::READ_COILS ||
+            function_code == ModbusFunctionCode::READ_DISCRETE_INPUTS ||
+            function_code == ModbusFunctionCode::READ_HOLDING_REGISTERS ||
             function_code == ModbusFunctionCode::READ_INPUT_REGISTERS) {
-          device->on_modbus_read_registers(function_code, uint16_t(data[1]) | (uint16_t(data[0]) << 8),
-                                           uint16_t(data[3]) | (uint16_t(data[2]) << 8));
-        } else if (function_code == ModbusFunctionCode::WRITE_SINGLE_REGISTER ||
-                   function_code == ModbusFunctionCode::WRITE_MULTIPLE_REGISTERS) {
-          device->on_modbus_write_registers(function_code, data);
+          this->spy_pending_start_ = (uint16_t(data[0]) << 8) | data[1];
+          this->spy_pending_count_ = (uint16_t(data[2]) << 8) | data[3];
+        } else {
+          this->spy_pending_start_ = 0;
+          this->spy_pending_count_ = 0;
         }
-      } else {  // We're a client
-        // Is it an error response?
-        if ((function_code & FUNCTION_CODE_EXCEPTION_MASK) == FUNCTION_CODE_EXCEPTION_MASK) {
-          uint8_t exception = raw[2];
-          ESP_LOGW(TAG,
-                   "Error function code: 0x%X exception: %" PRIu8 ", address: %" PRIu8 ", %" PRIu32
-                   "ms after last send",
-                   function_code, exception, address, millis() - this->last_send_);
-          if (this->waiting_for_response_ == address) {
-            device->on_modbus_error(function_code & FUNCTION_CODE_MASK, exception);
-          } else {
-            // Ignore modbus exception not related to a pending command
-            ESP_LOGD(TAG, "Ignoring error - not expecting a response from %" PRIu8 "", address);
+        this->spy_expect_response_ = true;
+        ESP_LOGD(TAG, "Spy: request FC=0x%02X unit=%" PRIu8 " start=0x%04X count=%" PRIu16, function_code, address,
+                 this->spy_pending_start_, this->spy_pending_count_);
+      }
+    } else {
+      // Observed a response; dispatch to registered spy devices
+      this->spy_expect_response_ = false;
+      if (address == this->spy_pending_address_) {
+        for (auto *device : this->devices_) {
+          if (device->address_ == address)
+            device->on_modbus_spy_response(this->spy_pending_fc_, this->spy_pending_start_,
+                                            this->spy_pending_count_, data);
+        }
+      } else {
+        ESP_LOGW(TAG, "Spy: response from unit %" PRIu8 " but expected unit %" PRIu8, address,
+                 this->spy_pending_address_);
+      }
+    }
+  } else {
+    bool found = false;
+    for (auto *device : this->devices_) {
+      if (device->address_ == address) {
+        found = true;
+        if (this->role == ModbusRole::SERVER) {
+          if (function_code == ModbusFunctionCode::READ_HOLDING_REGISTERS ||
+              function_code == ModbusFunctionCode::READ_INPUT_REGISTERS) {
+            device->on_modbus_read_registers(function_code, uint16_t(data[1]) | (uint16_t(data[0]) << 8),
+                                             uint16_t(data[3]) | (uint16_t(data[2]) << 8));
+          } else if (function_code == ModbusFunctionCode::WRITE_SINGLE_REGISTER ||
+                     function_code == ModbusFunctionCode::WRITE_MULTIPLE_REGISTERS) {
+            device->on_modbus_write_registers(function_code, data);
           }
-        } else {  // Not an error response
-          if (this->waiting_for_response_ == address) {
-            device->on_modbus_data(data);
-          } else {
-            // Ignore modbus response not related to a pending command
-            ESP_LOGW(TAG, "Ignoring response - not expecting a response from %" PRIu8 ", %" PRIu32 "ms after last send",
-                     address, millis() - this->last_send_);
+        } else {  // We're a client
+          // Is it an error response?
+          if ((function_code & FUNCTION_CODE_EXCEPTION_MASK) == FUNCTION_CODE_EXCEPTION_MASK) {
+            uint8_t exception = raw[2];
+            ESP_LOGW(TAG,
+                     "Error function code: 0x%X exception: %" PRIu8 ", address: %" PRIu8 ", %" PRIu32
+                     "ms after last send",
+                     function_code, exception, address, millis() - this->last_send_);
+            if (this->waiting_for_response_ == address) {
+              device->on_modbus_error(function_code & FUNCTION_CODE_MASK, exception);
+            } else {
+              // Ignore modbus exception not related to a pending command
+              ESP_LOGD(TAG, "Ignoring error - not expecting a response from %" PRIu8 "", address);
+            }
+          } else {  // Not an error response
+            if (this->waiting_for_response_ == address) {
+              device->on_modbus_data(data);
+            } else {
+              // Ignore modbus response not related to a pending command
+              ESP_LOGW(TAG,
+                       "Ignoring response - not expecting a response from %" PRIu8 ", %" PRIu32 "ms after last send",
+                       address, millis() - this->last_send_);
+            }
           }
         }
       }
     }
-  }
 
-  if (!found && this->role == ModbusRole::CLIENT) {
-    ESP_LOGW(TAG, "Got frame from unknown address %" PRIu8 ", %" PRIu32 "ms after last send", address,
-             millis() - this->last_send_);
+    if (!found && this->role == ModbusRole::CLIENT) {
+      ESP_LOGW(TAG, "Got frame from unknown address %" PRIu8 ", %" PRIu32 "ms after last send", address,
+               millis() - this->last_send_);
+    }
   }
 
   this->clear_rx_buffer_(LOG_STR("parse succeeded"));
@@ -416,6 +464,8 @@ void Modbus::clear_rx_buffer_(const LogString *reason, bool warn) {
     if (warn) {
       ESP_LOGW(TAG, "Clearing buffer of %zu bytes - %s %" PRIu32 "ms after last send", at, LOG_STR_ARG(reason),
                millis() - this->last_send_);
+      if (this->role == ModbusRole::SPY)
+        this->spy_expect_response_ = false;
     } else {
       ESP_LOGV(TAG, "Clearing buffer of %zu bytes - %s %" PRIu32 "ms after last send", at, LOG_STR_ARG(reason),
                millis() - this->last_send_);

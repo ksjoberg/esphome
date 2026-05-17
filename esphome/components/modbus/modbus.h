@@ -17,6 +17,7 @@ static constexpr uint16_t MODBUS_TX_BUFFER_SIZE = 15;
 enum ModbusRole {
   CLIENT,
   SERVER,
+  SPY,
 };
 
 class ModbusDevice;
@@ -78,6 +79,12 @@ class Modbus : public uart::UARTDevice, public Component {
   uint8_t waiting_for_response_{0};
   bool disable_crc_{false};
 
+  bool spy_expect_response_{false};
+  uint8_t spy_pending_fc_{0};
+  uint16_t spy_pending_start_{0};
+  uint16_t spy_pending_count_{0};
+  uint8_t spy_pending_address_{0};
+
   GPIOPin *flow_control_pin_{nullptr};
 
   std::vector<uint8_t> rx_buffer_;
@@ -96,6 +103,8 @@ class ModbusDevice {
   virtual void on_modbus_error(uint8_t function_code, uint8_t exception_code) {}
   virtual void on_modbus_read_registers(uint8_t function_code, uint16_t start_address, uint16_t number_of_registers){};
   virtual void on_modbus_write_registers(uint8_t function_code, const std::vector<uint8_t> &data){};
+  virtual void on_modbus_spy_response(uint8_t function_code, uint16_t start_address, uint16_t register_count,
+                                       const std::vector<uint8_t> &data) {}
   void send(uint8_t function, uint16_t start_address, uint16_t number_of_entities, uint8_t payload_len = 0,
             const uint8_t *payload = nullptr) {
     this->parent_->send(this->address_, function, start_address, number_of_entities, payload_len, payload);

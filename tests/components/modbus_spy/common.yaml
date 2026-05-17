@@ -1,0 +1,26 @@
+modbus:
+  - id: mod_bus_spy
+    uart_id: uart_bus
+    role: spy
+
+modbus_spy:
+  - id: spy_dev
+    modbus_id: mod_bus_spy
+    address: 0x01
+
+sensor:
+  - platform: modbus_spy
+    modbus_spy_id: spy_dev
+    name: "Spy Holding Reg 0x0040"
+    register_address: 0x0040
+    value_type: U_WORD
+  - platform: modbus_spy
+    modbus_spy_id: spy_dev
+    name: "Spy Holding Reg 0x0041 signed"
+    register_address: 0x0041
+    value_type: S_WORD
+  - platform: modbus_spy
+    modbus_spy_id: spy_dev
+    name: "Spy Holding Reg 0x0042 float"
+    register_address: 0x0042
+    value_type: FP32
