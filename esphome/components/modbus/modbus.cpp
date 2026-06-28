@@ -154,35 +154,83 @@ void ModbusClientHub::parse_modbus_frames() {
   }
 }
 
+bool ModbusServerHub::is_owned_address_(uint8_t address) const {
+  if (address == 0)  // broadcast
+    return true;
+  for (auto *device : this->devices_) {
+    if (device->address_ == address)
+      return true;
+  }
+  return false;
+}
+
+ModbusServerSpyDevice *ModbusServerHub::find_spy_device_(uint8_t address) const {
+  for (auto *device : this->spy_devices_) {
+    if (device->address_ == address)
+      return device;
+  }
+  return nullptr;
+}
+
+void ModbusServerHub::drop_unhandled_frame_(const LogString *reason) {
+  // Locate the frame boundary by CRC (works for any request/response layout or unknown function
+  // code) and discard exactly that frame, so a frame addressed to us that arrived back-to-back is
+  // not discarded along with it. If no boundary is found and the bus has gone idle, the buffered
+  // bytes are a corrupt or partial foreign frame, so drop whatever remains. Never warns.
+  uint16_t frame_end = this->find_custom_frame_end_(MIN_FRAME_SIZE);
+  if (frame_end != 0) {
+    this->clear_rx_buffer_(reason, false, frame_end);
+  } else if (this->timeout_()) {
+    this->clear_rx_buffer_(reason, false);
+  }
+  // Otherwise wait for more bytes (handled by the caller's no-progress break).
+}
+
 void ModbusServerHub::parse_modbus_frames() {
+  // RTU multi-drop conformance: classify each frame by its address byte *first*, before any
+  // CRC validation, so foreign traffic (other devices' requests/responses, unknown function codes)
+  // is discarded silently and can never desynchronize the parser or generate CRC warnings.
   while (!this->rx_buffer_.empty()) {
     size_t size = this->rx_buffer_.size();
-    ESP_LOGVV(TAG, "Parsing frames buffer size = %" PRIu32, size);
-    bool retry_as_client = false;
-    if (this->expecting_peer_response_ != 0) {
+    uint8_t address = this->rx_buffer_[0];
+
+    if (this->spy_expecting_response_ != 0 && address == this->spy_expecting_response_) {
+      // The previous frame was a request to this spied device; this frame is its response.
+      // parse_modbus_server_frame_ invokes process_modbus_server_frame() (our spy dispatch) on success.
       if (!this->parse_modbus_server_frame_()) {
-        ESP_LOGV(TAG, "Stop expecting peer response from %" PRIu8 " due to parse failure, and retry parse",
-                 this->expecting_peer_response_);
-        this->expecting_peer_response_ = 0;
-        retry_as_client = true;
-      } else if (this->timeout_() && size == this->rx_buffer_.size()) {
-        // If we timed out and the above parse attempt did not consume data, stop expecting a response
-        ESP_LOGV(TAG,
-                 "Stop expecting peer response from %" PRIu8 " due to timeout after partial response, and retry parse",
-                 this->expecting_peer_response_);
-        this->expecting_peer_response_ = 0;
-        retry_as_client = true;
+        // Desynced (e.g. the response was missed and this is a new request): drop exactly one frame.
+        this->spy_expecting_response_ = 0;
+        this->drop_unhandled_frame_(LOG_STR("spy response parse failed"));
       }
-    } else {
+    } else if (this->is_owned_address_(address)) {
+      // Request addressed to us (or broadcast): CRC-validate, parse and respond. CRC failures here
+      // are genuine corruption of a frame meant for us, so they warn.
       if (!this->parse_modbus_client_frame_())
         this->clear_rx_buffer_(LOG_STR("parse failed"), true);
+    } else if (this->find_spy_device_(address) != nullptr) {
+      // Request to a spied device: learn the registers it covers, then await its response.
+      if (!this->parse_modbus_spy_request_(address))
+        this->drop_unhandled_frame_(LOG_STR("spy request parse failed"));
+    } else {
+      // Foreign frame: addressed to neither us nor a spied device. Drop it silently so it can never
+      // CRC-warn or desync the parser, while preserving any back-to-back frame addressed to us.
+      this->drop_unhandled_frame_(LOG_STR("ignoring frame for another device"));
     }
-    // Stop if the buffer didn't shrink (no frame consumed) and no mode switch triggered a retry
-    if (!retry_as_client && size <= this->rx_buffer_.size())
-      break;
+
+    if (size <= this->rx_buffer_.size())
+      break;  // no frame consumed: waiting for more bytes
   }
-  if (this->timeout_())
-    this->clear_rx_buffer_(LOG_STR("timeout after partial response"), true);
+
+  // Anything still buffered after the inter-frame gap is a stalled partial frame.
+  if (this->timeout_() && !this->rx_buffer_.empty()) {
+    if (this->is_owned_address_(this->rx_buffer_[0])) {
+      this->clear_rx_buffer_(LOG_STR("timeout after partial frame"), true);
+    } else {
+      // Partial spied or foreign frame: drop quietly and resync the spy correlation.
+      this->clear_rx_buffer_(LOG_STR("timeout after partial frame"), false);
+      this->spy_expecting_response_ = 0;
+    }
+  }
 }
 
 uint16_t Modbus::find_custom_frame_end_(uint16_t min_length) const {
@@ -320,22 +368,64 @@ void ModbusClientHub::process_modbus_server_frame(uint8_t address, uint8_t funct
   }
 }
 
-void ModbusServerHub::process_modbus_server_frame(uint8_t address, uint8_t function_code, const uint8_t *, uint16_t) {
-  for (auto *device : this->devices_) {
-    if (device->address_ == address) {
-      ESP_LOGE(TAG, "Unexpected response from address %" PRIu8 ", which is mapped to this device.", address);
-    }
-  }
+bool ModbusServerHub::parse_modbus_spy_request_(uint8_t address) {
+  size_t size = this->rx_buffer_.size();
+  uint16_t frame_length = helpers::client_frame_length(this->rx_buffer_.data(), size);
 
-  if (this->expecting_peer_response_ == address) {
-    ESP_LOGV(TAG, "Expected response from peer %" PRIu8 " received", address);
+  if (size < frame_length)
+    return true;  // wait for the rest of the request
+
+  uint8_t function_code = this->rx_buffer_[1];
+
+  if (helpers::is_function_code_custom(function_code)) {
+    frame_length = this->find_custom_frame_end_(frame_length);
+    if (frame_length == 0)
+      return size < MAX_FRAME_SIZE;  // keep accumulating until we hit max size
   } else {
-    ESP_LOGV(TAG, "Unexpected response from peer %" PRIu8 " received", address);
+    if (crc16(&this->rx_buffer_[0], frame_length) != 0)
+      return false;
   }
 
-  // This always resets, even if the address doesn't match.
-  // If an unexpected response is received, we can't trust that a correct response will follow (it shouldn't).
-  this->expecting_peer_response_ = 0;
+  uint8_t data_offset = helpers::client_frame_data_offset(this->rx_buffer_.data(), size);
+  const uint8_t *data = this->rx_buffer_.data() + data_offset;
+  uint16_t data_len = frame_length - 2 - data_offset;
+
+  // Cache the request context so the captured response can be mapped back to register addresses.
+  this->spy_pending_fc_ = function_code;
+  if (helpers::is_function_code_read(function_code) && data_len >= 4) {
+    this->spy_pending_start_ = helpers::get_data<uint16_t>(data, 0);
+    this->spy_pending_count_ = helpers::get_data<uint16_t>(data, 2);
+  } else {
+    this->spy_pending_start_ = 0;
+    this->spy_pending_count_ = 0;
+  }
+  // Broadcasts get no response, so don't arm response capture for them.
+  this->spy_expecting_response_ = address != 0 ? address : 0;
+  ESP_LOGV(TAG, "Spy: request FC=0x%02X unit=%" PRIu8 " start=0x%04X count=%" PRIu16, function_code, address,
+           this->spy_pending_start_, this->spy_pending_count_);
+
+  this->clear_rx_buffer_(LOG_STR("spy request parsed"), false, frame_length);
+  return true;
+}
+
+void ModbusServerHub::process_modbus_server_frame(uint8_t address, uint8_t function_code, const uint8_t *data,
+                                                  uint16_t len) {
+  // Only reached for an expected response from a spied device (see parse_modbus_frames).
+  uint8_t pending_fc = this->spy_pending_fc_;
+  uint16_t pending_start = this->spy_pending_start_;
+  uint16_t pending_count = this->spy_pending_count_;
+  this->spy_expecting_response_ = 0;
+
+  if (helpers::is_function_code_exception(function_code)) {
+    ESP_LOGD(TAG, "Spy: exception response from unit %" PRIu8 ", skipping", address);
+    return;
+  }
+
+  std::vector<uint8_t> payload(data, data + len);
+  for (auto *device : this->spy_devices_) {
+    if (device->address_ == address)
+      device->on_modbus_spy_response(pending_fc, pending_start, pending_count, payload);
+  }
 }
 
 void ModbusServerHub::process_modbus_client_frame_(uint8_t address, uint8_t function_code, const uint8_t *data,
@@ -361,8 +451,8 @@ void ModbusServerHub::process_modbus_client_frame_(uint8_t address, uint8_t func
   }
 
   if (!found) {
-    this->expecting_peer_response_ = address;
-    ESP_LOGV(TAG, "Request to peer %" PRIu8 " received", address);
+    // Only reached for the broadcast address (0), which no device claims; nothing to answer.
+    ESP_LOGV(TAG, "Unhandled request for address %" PRIu8, address);
   }
 }
 

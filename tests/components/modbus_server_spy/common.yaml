@@ -1,0 +1,33 @@
+modbus:
+  - id: mod_bus_spy
+    uart_id: uart_bus
+    role: server
+
+# Active server: we answer the master as slave 0x02.
+modbus_server:
+  - id: server_self
+    modbus_id: mod_bus_spy
+    address: 0x02
+    registers:
+      - address: 0x0000
+        value_type: U_WORD
+        read_lambda: |-
+          return 42;
+
+# Passive spy: a third-party slave 0x01 on the same bus whose registers we capture.
+modbus_server_spy:
+  - id: spied_meter
+    modbus_id: mod_bus_spy
+    address: 0x01
+
+sensor:
+  - platform: modbus_server_spy
+    modbus_server_spy_id: spied_meter
+    name: "Spied Voltage"
+    register_address: 0x000C
+    value_type: FP32
+  - platform: modbus_server_spy
+    modbus_server_spy_id: spied_meter
+    name: "Spied Current"
+    register_address: 0x000E
+    value_type: U_WORD

@@ -19,6 +19,7 @@ ModbusClient = modbus_ns.class_("ModbusClientHub", Modbus)
 ModbusDevice = modbus_ns.class_("ModbusDevice")
 ModbusClientDevice = modbus_ns.class_("ModbusClientDevice")
 ModbusServerDevice = modbus_ns.class_("ModbusServerDevice")
+ModbusServerSpyDevice = modbus_ns.class_("ModbusServerSpyDevice")
 MULTI_CONF = True
 
 CONF_ROLE = "role"
@@ -127,6 +128,13 @@ async def register_modbus_server_device(var, config):
     cg.add(var.set_parent(parent))
     cg.add(var.set_address(config[CONF_ADDRESS]))
     cg.add(parent.register_device(var))
+
+
+async def register_modbus_server_spy_device(var, config):
+    parent = await cg.get_variable(config[CONF_MODBUS_ID])
+    cg.add(var.set_parent(parent))
+    cg.add(var.set_address(config[CONF_ADDRESS]))
+    cg.add(parent.register_spy_device(var))
 
 
 async def register_modbus_device(var, config):

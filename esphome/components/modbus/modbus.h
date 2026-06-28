@@ -74,6 +74,7 @@ class Modbus : public uart::UARTDevice, public Component {
 
 class ModbusClientDevice;
 class ModbusServerDevice;
+class ModbusServerSpyDevice;
 
 struct ModbusDeviceCommand {
   ModbusClientDevice *device;
@@ -136,18 +137,42 @@ class ModbusServerHub : public Modbus {
     this->send_raw_(payload.data(), static_cast<uint16_t>(payload.size()));
   };
   void register_device(ModbusServerDevice *device) { this->devices_.push_back(device); }
+  // Register a passive device whose register values are captured ("spied") from another device's
+  // request/response traffic on the bus. The hub never answers for a spied address.
+  void register_spy_device(ModbusServerSpyDevice *device) { this->spy_devices_.push_back(device); }
 
  protected:
   friend class ModbusServerDevice;
 
   void parse_modbus_frames() override;
   bool parse_modbus_client_frame_();
+  // Passively parses a request addressed to a spied device to learn the registers it covers, then
+  // arms the hub to capture that device's response. Never sends a reply.
+  bool parse_modbus_spy_request_(uint8_t address);
   // Parsers need to handle standard (ModbusFunctionCode) and custom (uint8_t) function codes, so we use uint8_t here.
+  // For a server hub this is only reached for an expected response from a spied device; it dispatches the
+  // captured register data to the matching spy device(s).
   void process_modbus_server_frame(uint8_t address, uint8_t function_code, const uint8_t *data, uint16_t len) override;
   void process_modbus_client_frame_(uint8_t address, uint8_t function_code, const uint8_t *data, uint16_t len);
   void send_raw_(const uint8_t *payload, uint16_t len);
-  uint8_t expecting_peer_response_{0};
+  // True for the broadcast address or any address we answer for as a server.
+  bool is_owned_address_(uint8_t address) const;
+  // Returns the spy device registered for the given address, or nullptr.
+  ModbusServerSpyDevice *find_spy_device_(uint8_t address) const;
+  // Silently drops exactly one complete frame from the front of the buffer (located by its CRC
+  // boundary) so a back-to-back frame addressed to us is preserved. Used for foreign traffic and
+  // desynced spy frames; never warns.
+  void drop_unhandled_frame_(const LogString *reason);
+
   std::vector<ModbusServerDevice *> devices_;
+  std::vector<ModbusServerSpyDevice *> spy_devices_;
+
+  // Spy request/response correlation. While non-zero, the next frame from this address is the
+  // response we're waiting to capture; the pending_* fields describe the originating request.
+  uint8_t spy_expecting_response_{0};
+  uint8_t spy_pending_fc_{0};
+  uint16_t spy_pending_start_{0};
+  uint16_t spy_pending_count_{0};
 
   // Holds the raw payload of a single reply deferred for sending when tx was blocked at send time.
   // Only one server reply can be in flight at once, so a single fixed buffer avoids heap allocation.
@@ -224,6 +249,32 @@ class ModbusServerDevice {
                                  static_cast<uint8_t>(exception_code)};
     this->parent_->send_raw_(error_response, 3);
   }
+
+ protected:
+  friend ModbusServerHub;
+
+  ModbusServerHub *parent_{nullptr};
+  uint8_t address_{0};
+};
+
+// A passive device attached to a ModbusServerHub. It represents a third-party device on the bus
+// whose register values are captured from the traffic between that device and the controller. It never
+// transmits; the hub only delivers observed responses to it.
+class ModbusServerSpyDevice {
+ public:
+  ModbusServerSpyDevice() = default;
+  ModbusServerSpyDevice(ModbusServerHub *parent, uint8_t address) : parent_(parent), address_(address) {}
+  virtual ~ModbusServerSpyDevice() = default;
+  ModbusServerSpyDevice(const ModbusServerSpyDevice &) = delete;
+  ModbusServerSpyDevice &operator=(const ModbusServerSpyDevice &) = delete;
+  ModbusServerSpyDevice(ModbusServerSpyDevice &&) = delete;
+  ModbusServerSpyDevice &operator=(ModbusServerSpyDevice &&) = delete;
+  void set_parent(ModbusServerHub *parent) { this->parent_ = parent; }
+  void set_address(uint8_t address) { this->address_ = address; }
+  // Called when a response to a read request addressed to this device has been observed on the bus.
+  // start_address and register_count come from the originating request; data is the response payload.
+  virtual void on_modbus_spy_response(uint8_t function_code, uint16_t start_address, uint16_t register_count,
+                                      const std::vector<uint8_t> &data) {}
 
  protected:
   friend ModbusServerHub;
